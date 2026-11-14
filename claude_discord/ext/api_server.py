@@ -30,7 +30,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 from urllib.parse import urlsplit
 
 from aiohttp import web
@@ -48,6 +48,7 @@ from ..thread_marker import (
     MAX_THREAD_NAME_LENGTH,
     OUTCOME_ACTION,
     OUTCOME_CANDIDATE,
+    OUTCOME_DONE,
     OUTCOME_REVIEW,
     OUTCOME_WAITING,
     family_code,
@@ -57,6 +58,7 @@ from ..thread_policy import THREAD_AUTO_ARCHIVE_MINUTES
 from ..thread_status import request_thread_outcome
 from . import ingest_manifest, teams_reply, teams_sync
 from .attention_api import handle_attention
+from .decision_api import read_mark_request, remember_mark
 from .entra_auth import EntraTokenVerifier, looks_like_jwt
 from .pages_api import (
     handle_add_item,
@@ -81,6 +83,7 @@ if TYPE_CHECKING:
     from claude_code_core.attention_repo import HumanActivityRepository
 
     from ..database.claims_repo import ClaimRepository
+    from ..database.decision_repo import DecisionRequestRepository
     from ..database.ingest_repo import IngestResultRepository
     from ..database.lineage_repo import ThreadLineageRepository
     from ..database.lounge_repo import LoungeRepository
@@ -308,6 +311,7 @@ class ApiServer:
         claims_repo: ClaimRepository | None = None,
         lineage_repo: ThreadLineageRepository | None = None,
         situation_repo: ThreadSituationRepository | None = None,
+        decision_repo: DecisionRequestRepository | None = None,
         page_repo: PageRepository | None = None,
         transcripts_path: str | None = None,
         ingest_require_complete: bool | None = None,
@@ -343,6 +347,8 @@ class ApiServer:
         self.claims_repo = claims_repo
         self.lineage_repo = lineage_repo
         self.situation_repo = situation_repo
+        # Decision requests (ADR-0024): what agents asked the person, until answered.
+        self.decision_repo = decision_repo
         self.page_repo = page_repo
         # Human-activity metering (GET /api/attention). Wired by
         # BridgeComponents.apply_to_api_server; 503 until then.
@@ -454,6 +460,7 @@ class ApiServer:
         self.app.router.add_patch("/api/pages/{slug}/items/{key}", self.resolve_page_item)
         self.app.router.add_post("/api/threads/{thread_id}/done", self.mark_thread_done)
         self.app.router.add_post("/api/threads/{thread_id}/candidate", self.mark_thread_done)
+        self.app.router.add_post("/api/threads/{thread_id}/complete", self.complete_thread)
         self.app.router.add_post("/api/threads/{thread_id}/waiting", self.mark_thread_waiting)
         self.app.router.add_post("/api/threads/{thread_id}/review", self.mark_thread_review)
         self.app.router.add_post("/api/threads/{thread_id}/action", self.mark_thread_action)
@@ -1896,6 +1903,24 @@ class ApiServer:
         """
         return await self._mark_thread_outcome(request, OUTCOME_CANDIDATE)
 
+    async def complete_thread(self, request: web.Request) -> web.Response:
+        """POST /api/threads/{thread_id}/complete — close it on the user's explicit request.
+
+        See :mod:`claude_discord.ext.thread_complete_api` for the rules.
+        """
+        from .thread_complete_api import handle_complete_thread
+
+        async def mark_done(req: web.Request) -> web.Response:
+            return await self._mark_thread_outcome(req, OUTCOME_DONE)
+
+        return await handle_complete_thread(
+            request,
+            console=self._console,
+            lineage=self.lineage_repo,
+            running_thread_ids=self._running_thread_ids,
+            mark_without_console=mark_done,
+        )
+
     async def list_pages(self, request: web.Request) -> web.Response:
         """GET /api/pages — the screens registered with the Console, with open counts."""
         return await handle_list_pages(request, self.page_repo)
@@ -1957,7 +1982,20 @@ class ApiServer:
             thread_id = int(request.match_info["thread_id"])
         except (ValueError, KeyError):
             return web.json_response({"error": "Invalid thread_id"}, status=400)
+        # Checked before the mark: a refused request must not leave a bare marker behind.
+        spec, refused = await read_mark_request(request, outcome)
+        if refused is not None:
+            return refused
+        response = await self._apply_thread_outcome(thread_id, outcome)
+        if response.status in (200, 202):
+            stored = await remember_mark(self.decision_repo, thread_id, outcome, spec)
+            if stored is not None:
+                body = json.loads(cast(bytes, response.body))
+                body["request_id"] = stored.id
+                return web.json_response(body, status=response.status)
+        return response
 
+    async def _apply_thread_outcome(self, thread_id: int, outcome: str) -> web.Response:
         conversations = self.console_conversations
         if conversations is not None and await conversations.get(thread_id) is not None:
             from ..console.surface import apply_outcome

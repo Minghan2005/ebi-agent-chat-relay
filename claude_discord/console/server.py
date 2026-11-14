@@ -68,6 +68,7 @@ from .places import PlaceError, PlaceRepository
 from .places import clean_name as clean_place
 from .ratelimit import RateLimiter
 from .search import SearchRoutes
+from .secretary import SecretaryEventRepository, SecretaryRoutes, build_secretary
 from .surface import apply_outcome
 from .triage import INTERVAL_SECONDS as TRIAGE_INTERVAL_SECONDS
 from .triage import (
@@ -261,8 +262,11 @@ class ConsoleServer:
         account_router: AccountRouter | None = None,
         cli_login: CliLogin | None = None,
         views: SavedViewRepository | None = None,
+        secretary_events: SecretaryEventRepository | None = None,
     ) -> None:
         self.api = api_server
+        #: Secretary mode's trial metrics; None turns recording off.
+        self.secretary_events = secretary_events
         #: Named rules over the board; None leaves the list empty.
         self.views = views
         #: Signs the agent CLIs in from the browser; None hides the screen.
@@ -374,6 +378,9 @@ class ConsoleServer:
         r.add_patch(f"{API_PREFIX}/views/{{view_id}}", view_routes.patch)
         r.add_delete(f"{API_PREFIX}/views/{{view_id}}", view_routes.delete)
         page_routes = PageRoutes(self.api)
+        secretary_routes = SecretaryRoutes(self, self.secretary_events)
+        r.add_post(f"{API_PREFIX}/secretary/events", secretary_routes.record)
+        r.add_get(f"{API_PREFIX}/secretary/stats", secretary_routes.stats)
         r.add_post(f"{API_PREFIX}/pages/{{slug}}", page_routes.define)
         r.add_get(f"{API_PREFIX}/pages/{{slug}}/items", page_routes.items)
         r.add_post(f"{API_PREFIX}/pages/{{slug}}/items", page_routes.add)
@@ -642,12 +649,40 @@ class ConsoleServer:
                 "generated_at": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
                 "items": items,
                 "guide": build_guide(items, records=records),
+                "secretary": build_secretary(items, await self._open_requests()),
                 "slots": self._slots(),
                 "places": await self._place_list(items),
                 "views": await self._view_list(),
                 "pages": await self._page_list(),
             }
         )
+
+    async def _open_requests(self) -> list[dict[str, Any]]:
+        """The decision requests agents sent and nobody has answered (ADR-0024)."""
+        repo = getattr(self.api, "decision_repo", None)
+        if repo is None:
+            return []
+        try:
+            return [r.as_dict() for r in await repo.list_open()]
+        except Exception:
+            # The board still answers; the secretary home then lists the items as unexplained.
+            logger.exception("console: could not read decision requests")
+            return []
+
+    async def _close_requests(self, item_id: str, request_id: Any) -> None:
+        """A person answered in the Console: the request (or all of the thread's) is settled."""
+        repo = getattr(self.api, "decision_repo", None)
+        thread_id = _thread_of(item_id)
+        if repo is None or thread_id is None:
+            return
+        try:
+            if isinstance(request_id, int) and not isinstance(request_id, bool):
+                await repo.close(thread_id, reason="answered", request_id=request_id)
+            else:
+                await repo.close(thread_id, reason="replied")
+        except Exception:
+            # The reply has gone through; the card disappears anyway once the thread runs.
+            logger.exception("console: could not close the requests of %s", item_id)
 
     async def _view_list(self) -> list[dict[str, Any]]:
         """The saved views, sent with every board so all devices show the same list."""
@@ -1124,13 +1159,20 @@ class ConsoleServer:
         return web.json_response({"ok": True})
 
     async def done(self, request: web.Request) -> web.Response:
-        item_id = request.match_info["item_id"]
         try:
-            item = await self.work_repo.update(
-                item_id, {"state": STATE_DONE, "snoozed_until": None}
-            )
+            item, workspace = await self.complete_item(request.match_info["item_id"])
         except WorkItemError as exc:
             return _error(str(exc), 400)
+        return web.json_response({"item": item.as_dict(), "workspace": workspace})
+
+    async def complete_item(self, item_id: str) -> tuple[WorkItem, dict[str, Any] | None]:
+        """Mark *item_id* done the way the human's Done button does.
+
+        Shared by the Console's own action and the control-plane
+        ``/api/threads/{id}/complete`` an agent calls on the user's explicit
+        request. Raises :class:`WorkItemError` for an item that cannot move.
+        """
+        item = await self.work_repo.update(item_id, {"state": STATE_DONE, "snoozed_until": None})
         key = await self._conversation_key(item_id)
         if key is not None and self.conversations is not None:
             await apply_outcome(self.conversations, key, OUTCOME_DONE)
@@ -1140,7 +1182,7 @@ class ConsoleServer:
                 # Same marker the agent would set, so the chat sidebar agrees.
                 request_thread_outcome(thread, OUTCOME_DONE)
         workspace = await self._workspace_finish(item, done=True)
-        return web.json_response({"item": item.as_dict(), "workspace": workspace})
+        return item, workspace
 
     async def reopen(self, request: web.Request) -> web.Response:
         item_id = request.match_info["item_id"]
@@ -1185,13 +1227,17 @@ class ConsoleServer:
         if err:
             return err
         text = with_attachments(text, files)
-        return await self._deliver(
-            request.match_info["item_id"],
+        item_id = request.match_info["item_id"]
+        response = await self._deliver(
+            item_id,
             text,
             request[IDENTITY],
             metered=True,
             retitle_text=retitle_text,
         )
+        if response.status < 300:
+            await self._close_requests(item_id, body.get("request_id"))
+        return response
 
     async def _deliver(
         self,
@@ -1926,6 +1972,8 @@ async def _start_console(api_server: ApiServer, raw_port: str) -> ConsoleServer 
     await places.init_db()
     views = SavedViewRepository(api_server.session_repo.db_path)
     await views.init_db()
+    secretary_events = SecretaryEventRepository(api_server.session_repo.db_path)
+    await secretary_events.init_db()
     if triage is not None:
         await triage.init_db()
     console = ConsoleServer(
@@ -1944,6 +1992,7 @@ async def _start_console(api_server: ApiServer, raw_port: str) -> ConsoleServer 
         triage=triage,
         places=places,
         views=views,
+        secretary_events=secretary_events,
         cli_login=CliLogin(login_commands()),
     )
     await console.start()

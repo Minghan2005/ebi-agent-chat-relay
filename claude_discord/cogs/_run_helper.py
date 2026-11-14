@@ -172,10 +172,19 @@ def _build_done_marker_section(config: RunConfig) -> str | None:
         "that this thread looks ready to close, and mark it as a completion candidate:\n"
         '  `curl -s -X POST "$CCDB_API_URL/api/threads/$DISCORD_THREAD_ID/candidate"`\n'
         f"This prefixes the thread title with {marker}. It is only a proposal: the thread "
-        "stays listed until the user confirms it done, which only the user can do. Do NOT "
-        "mark it when you are asking "
+        "stays listed until the user confirms it done (the user decides; see the exception "
+        "below). Do NOT mark it when you are asking "
         "a question, waiting for a pipeline or a decision, or leaving work pending. "
         "If the user replies later, the marker is removed automatically.\n"
+        'Exception — the user explicitly asks you to close a thread ("mark the finished '
+        'child threads done"): then close it for them, this thread or one it spawned:\n'
+        '  `curl -s -X POST "$CCDB_API_URL/api/threads/<thread_id>/complete" '
+        '-H "Content-Type: application/json" -d \'{"from_thread": \'$DISCORD_THREAD_ID\', '
+        '"user_request": "<quote the request>"}\'`\n'
+        "Check each child first (its messages, open PRs, pending waits) and close only the "
+        "ones whose work is actually finished; report which you closed and which you left "
+        "open and why. Never use it on your own judgment — without an explicit request, "
+        "propose with /candidate.\n"
         "Customer replies: Preparing a draft is NOT sending it to the customer. "
         "Producing an answer, an attachment, or posting it in this AI conversation does not "
         "prove external delivery. Keep the thread in review while the user checks the draft, "
@@ -237,7 +246,9 @@ def _waiting_marker_hint() -> str:
         return ""
     return (
         "\nWhen instead your turn ends because only the user can move the work forward, "
-        "say plainly what you need from them and mark the thread with the ONE that fits:\n"
+        "say plainly what you need from them and mark the thread with the ONE that fits, "
+        'sending your decision request as the call\'s JSON body (see "Asking the user"; a '
+        "bare call still marks, but the user then gets no card):\n"
         + "\n".join(lines)
         + "\nThe marker is removed when the user replies. Do not use any of these while "
         "you are the one who still has work to do."
@@ -339,6 +350,11 @@ async def _build_system_context(config: RunConfig) -> str | None:
         "Creating a child thread still requires authorization to delegate."
     )
 
+    if getattr(config.runner, "api_port", None) is not None:
+        from ..decision_request import agent_guide
+
+        parts.append(agent_guide())
+
     parts.append(
         "## Situation panel for thread families\n"
         "Once this thread has child threads, the Console shows a panel beside the conversation "
@@ -348,12 +364,13 @@ async def _build_system_context(config: RunConfig) -> str | None:
         "started by a child's report:\n"
         f'  `curl -s -X PUT "$CCDB_API_URL/api/threads/{config.surface.thread_key}/situation" '
         '-H "Content-Type: application/json" '
-        '-d \'{"asks": [...], "doing": [...], "decided": [...]}\'`\n'
-        "Each field is an array of short strings; a field you send replaces that field, one you "
-        "leave out stays, and GET on the same URL returns the record. "
-        "`asks`: what only the user can answer or do now, each understandable on its own, with "
-        "your recommendation; gather your children's questions here so the user can answer you "
-        "alone, and remove an entry once it is answered. "
+        '-d \'{"doing": [...], "decided": [...]}\'`\n'
+        "A field you send replaces that field, one you leave out stays, and GET on the same "
+        "URL returns the record. "
+        'Do not write questions into `asks`: the panel\'s "needed from you" lists the open '
+        "decision requests of the whole family by itself (yours and your children's, see "
+        '"Asking the user"), and a question written here as text would be a second copy that '
+        "outlives its answer. Send `asks` only as `[]` to clear what an older turn wrote. "
         "`doing`: what is moving now, in a few words. "
         "`decided`: decisions made and outcomes finished; keep them across updates. "
         "No secrets, and no chat narrative. A thread without children need not use it."

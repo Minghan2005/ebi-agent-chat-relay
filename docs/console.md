@@ -114,6 +114,73 @@ The next move also considers only parent and standalone conversations, so delega
 cannot fill its candidate slots. Family decisions still link to the parent under **Decide
 together**. Open the parent to inspect a child explicitly.
 
+## Secretary mode
+
+The classic lists are built around agent threads. Someone running dozens of them ends up
+opening every thread that waits on them and re-reading it to learn what is being asked.
+Secretary mode is a second display mode built around **decisions** instead
+([ADR-0024](adr/0024-add-a-secretary-mode-built-around-decisions.md)). The switch sits at the
+top of the menu: **Display mode: Classic / Secretary**. It is remembered per browser, and
+the classic mode keeps its look and behavior. With secretary mode on, the menu gains
+**🗂 Secretary**. That screen becomes the home whenever the Console opens without a view
+in the address.
+
+The cards are **decision requests** written by the agent that asks, not summaries
+(v1 summarised each thread's last message with the triage model, and its cards could not be
+answered; see the ADR). A card has at most six lines and is meant to be answerable by someone
+who has forgotten the whole matter:
+
+```
+🔴 Delete hccjp now, or export its data first?
+About: the HCCJP environment of GA v2 is deleted on 11/17; that cannot be undone.
+A Delete as is [recommended]: no extra work; it holds mostly automated tests.
+B Export first: 30-60 minutes of work; storage costs cents a month.
+Deadline: before the deletion on 11/17
+[A Delete as is] [B Export first] [✏️ Another answer]   More ▾
+```
+
+- **🔴 Decide now** — cards for questions (❓) and steps only you can do (📋), ranked like
+  Focus with your own threads before delegated ones; the first three show, the rest are one
+  click away. A button sends the choice to the thread that asked, restating the question
+  (`「<title>」への回答: <label> — <effect>`), through the same reply endpoint as the detail pane.
+  **✏️ Another answer** sends words of your own the same way. **More ▾** unfolds the full
+  request: what it is about, what is happening and why now, what to decide, the choices and
+  their results, the recommendation and why, the material to decide with (the draft, the
+  diff, the numbers, rendered as Markdown), and the deadline.
+- **👀 To review** — the same cards for deliverables (👀).
+- **📭 Waiting without a request** — threads that wait on you (❓/👀/📋/⚠️) but whose agent
+  wrote no request, by title only. Nothing is summarised for them; open the thread.
+- **🤖 Agents at work** (one line each, no progress text) and **✅ Finished today**, where a
+  🏁 candidate can be confirmed with the usual ✅ writeback.
+- Each card names its thread (**↗ title**), one click away.
+
+**Where the requests come from.** An agent sends its request as the JSON body of the marker
+call (`POST /api/threads/{id}/waiting`, `/review` or `/action`). That store is the only place a
+request lives: the secretary home lists the requests of every family, and a family's
+[situation panel](#where-things-stand) shows the same cards for its own threads under
+**🙋 Needed from you**. A parent never copies a child's question. Agents are given the format
+and the bar in their run context. The Console checks the format with
+deterministic rules (`claude_discord/decision_request.py`; no model): the card's four parts,
+one line each, at most three choices (two or more for a question, exactly one recommended), at
+most 300 characters, and all seven parts of the detail. A request that fails is refused with
+400 and every problem listed (`problems`), plus the format (`format`), so the agent rewrites
+it in the same turn. A bare marker call still marks the thread as before; it shows no card.
+
+**When a card goes away.** Requests are stored in `decision_requests`, one open request per
+thread and `key`; a newer one with the same key replaces it. A request closes when the person
+answers from its card or replies in the Console, or when the thread is marked again without a
+request or marked 🏁/✅. It also shows only while its thread still carries ❓/👀/📋 and is not
+running, so a reply typed in Discord takes the card away as soon as the agent picks it up. Nothing here calls a model:
+the screen is computed from the board and the open requests (`claude_discord/console/secretary.py`,
+sent as `secretary` with every board).
+
+**Trial metrics.** To compare the modes over a week, the Console records which threads you
+open (in either mode) and which answers came from a card, with how long the question had
+waited. It records metadata only, never text. The table is `console_secretary_events`,
+and rows older than 180 days are dropped. `GET /console/api/secretary/stats?days=7` returns
+per-day threads opened, opened per mode, card answers and the median wait before a card
+answer.
+
 ## Automatic triage
 
 Nobody fills in priority and due date for every thread, so the console asks a fast model
@@ -556,7 +623,7 @@ Endpoints need authentication unless marked *(no sign-in)*. Every method except 
 | GET | `/console/api/passkeys` | Registered passkeys (names and dates, never key material) |
 | POST | `/console/api/passkeys/invite` | A single-use code for adding another device |
 | DELETE | `/console/api/passkeys/{id}` | Remove a passkey and its sessions |
-| GET | `/console/api/board` | Every item, sorted for triage, plus slot usage and the Focus `guide` |
+| GET | `/console/api/board` | Every item, sorted for triage, plus slot usage, the Focus `guide` and the [secretary](#secretary-mode) summary |
 | GET | `/console/api/usage` | Per backend (or pool profile): `available`, `unavailable_until`, and `windows[]` of `{type, utilization, resets_at, status, reset}` |
 | GET | `/console/api/cli-login` | Per CLI: `logged_in` (`null` when unknown), `method`, and the sign-in in progress (`flow`: `state`, `url`, `user_code`, `needs_code`, `message`, `expires_at`) — never a credential |
 | POST | `/console/api/cli-login/{backend}` | `{action: "start" \| "cancel"}` or `{action: "code", code}` (Claude's pasted code) for `claude` / `codex`; 409 when the attempt cannot take it |
@@ -566,6 +633,8 @@ Endpoints need authentication unless marked *(no sign-in)*. Every method except 
 | POST | `/console/api/items/{id}/reply` | `{text}` — continues the session, queued behind a running turn |
 | POST | `/console/api/items/{id}/done` | Mark done (also sets the ✅ marker on the thread) |
 | POST | `/console/api/items/{id}/reopen` | Clear the done/someday verdict |
+| POST | `/console/api/secretary/events` | `{kind: "open" \| "answer", item_id, mode?: "classic" \| "secretary", waited_seconds?}` — a [secretary-mode](#secretary-mode) trial record (204) |
+| GET | `/console/api/secretary/stats?days=7` | Per local day: `opened_threads`, `by_mode`, `card_answers`, `answer_wait_seconds_median` |
 | GET / POST | `/console/api/views` | The saved views (also in every board as `views`); save one with `{name, query}` — see [Saved views](#saved-views-and-the-filter-language) |
 | PATCH / DELETE | `/console/api/views/{id}` | Change (`name`, `query`, `position`) or delete a saved view |
 | POST | `/console/api/pages/{slug}` | Define a [page](console-pages.md) (also in every board as `pages`) |
@@ -673,13 +742,19 @@ The parent keeps its part with the control-plane API. Agents are told how in the
 ```bash
 curl -s -X PUT "$CCDB_API_URL/api/threads/$DISCORD_THREAD_ID/situation" \
   -H "Content-Type: application/json" \
-  -d '{"asks": ["Move on 11/9 or 11/16? I recommend 11/16: testing ends on the 13th."],
-       "doing": ["Payments and E2E tests in two children"],
+  -d '{"doing": ["Payments and E2E tests in two children"],
        "decided": ["Payments stay on one provider"]}'
 ```
 
 Each field is an array of up to 40 strings of up to 600 characters. A field you send replaces that
-field and one you leave out stays. An unknown field is refused. `GET` on the same URL returns the record,
+field and one you leave out stays.
+
+**🙋 Needed from you** is not written by the parent any more. It shows the family's open
+[decision requests](#secretary-mode) as the same cards as the secretary home (same buttons, an answer
+goes to the thread that asked), then the threads that wait on the person without a request, and any
+text an older turn left in `asks`; those two are tagged **no request**. Agents are told not to write
+questions into `asks`; plain strings are still accepted for compatibility, and an object entry is
+refused with a pointer to the markers. `doing` and `decided` keep their role. An unknown field is refused. `GET` on the same URL returns the record,
 and the Console reads it from `GET /console/api/items/{id}/situation` along with the active waits. The record is
 stored per thread (`thread_situation`), not in `status.md`:
 one project can have several families at once and a family can exist with no project, see

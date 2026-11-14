@@ -301,8 +301,9 @@ async def test_human_console_reply_schedules_retitle_with_only_human_text(
     cog._schedule_retitle.assert_called_once_with(thread, human_text)
 
 
+@pytest.mark.parametrize("delivery_status", [202, 409])
 async def test_reply_preserves_raw_human_text_for_retitle_after_transformations(
-    monkeypatch,
+    monkeypatch, delivery_status: int
 ) -> None:
     from pathlib import Path
 
@@ -318,27 +319,39 @@ async def test_reply_preserves_raw_human_text_for_retitle_after_transformations(
     )
     raw_text = "Please investigate this long incident report."
     agent_text = "Read message.txt for the full user message and respond to it."
-    monkeypatch.setattr(console, "_json", AsyncMock(return_value=({"text": raw_text}, None)))
+    monkeypatch.setattr(
+        console,
+        "_json",
+        AsyncMock(return_value=({"text": raw_text, "request_id": 17}, None)),
+    )
     monkeypatch.setattr(
         console,
         "_reply_files",
         lambda raw: ([("/uploads/report.txt", Path("/tmp/report.txt"))], None),
     )
     monkeypatch.setattr(console, "_attach_long_text", AsyncMock(return_value=(agent_text, None)))
-    monkeypatch.setattr(console, "_deliver", AsyncMock(return_value=web.Response(status=202)))
+    monkeypatch.setattr(
+        console, "_deliver", AsyncMock(return_value=web.Response(status=delivery_status))
+    )
+    close_requests = AsyncMock()
+    monkeypatch.setattr(console, "_close_requests", close_requests, raising=False)
     request = MagicMock()
     request.match_info = {"item_id": "t123"}
     request.__getitem__.side_effect = lambda key: "Ming" if key == IDENTITY else None
 
     response = await console.reply(request)
 
-    assert response.status == 202
+    assert response.status == delivery_status
     console._deliver.assert_awaited_once()
     args, kwargs = console._deliver.await_args
     assert args[0] == "t123"
     assert args[1].startswith(agent_text)
     assert "/uploads/report.txt" in args[1]
     assert kwargs == {"metered": True, "retitle_text": raw_text}
+    if delivery_status < 300:
+        close_requests.assert_awaited_once_with("t123", 17)
+    else:
+        close_requests.assert_not_awaited()
 
 
 async def test_pin_order_endpoint_and_write_guards(client) -> None:
